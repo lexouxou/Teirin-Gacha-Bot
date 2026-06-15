@@ -1,0 +1,11 @@
+# Env var files
+.env
+venv/
+.venv/
+env/
+
+# Creditentials files
+*.json
+
+# Py dependencies
+__pycache__/
