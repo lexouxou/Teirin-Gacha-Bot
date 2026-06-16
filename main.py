@@ -147,7 +147,7 @@ class PackView(discord.ui.View):
             self.picked = True
         
         try:
-            all_draft_values = draft_tab.get_all_values()
+            all_draft_values = await asyncio.to_thread(draft_tab.get_all_values)
             valid_draft_rows = [r for r in all_draft_values[1:] if r and r[0]]
             
             expected_row, total_opened, N = get_expected_turn(valid_draft_rows)
@@ -160,7 +160,7 @@ class PackView(discord.ui.View):
             player = self.pack_data[index]
             # --- GOOGLE SHEETS API OPTIMIZATION ---
             # We retrieve the pool values all at once (Avoids find() + get_all_records())
-            all_pool_values = pool_tab.get_all_values()
+            all_pool_values = await asyncio.to_thread(pool_tab.get_all_values)
             osu_id_col = HEADER_POOL.index("Osu_ID")
             player_row_idx = next(i + 1 for i, r in enumerate(all_pool_values) if len(r) > osu_id_col and str(r[osu_id_col]) == str(player['Osu_ID']))
 
@@ -168,7 +168,7 @@ class PackView(discord.ui.View):
             team_assigned_idx = HEADER_POOL.index("Team_Assigned") + 1
             
             # Batch Update: Updates the 2 player cells in a single request
-            pool_tab.batch_update([
+            await asyncio.to_thread(pool_tab.batch_update, [
                 {'range': rowcol_to_a1(player_row_idx, status_idx), 'values': [["Drafted"]]},
                 {'range': rowcol_to_a1(player_row_idx, team_assigned_idx), 'values': [[self.team_id]]}
             ])
@@ -200,11 +200,11 @@ class PackView(discord.ui.View):
             draft_data[3] = max(0, 8 - new_opened)
             draft_data[5] = new_team_str
             draft_data[6] = current_rerolls
-            draft_tab.update(range_name=f"C{draft_row}:G{draft_row}", values=[draft_data[2:7]])
+            await asyncio.to_thread(draft_tab.update, range_name=f"C{draft_row}:G{draft_row}", values=[draft_data[2:7]])
             
             log_user_name = "AUTO-PICK" if is_timeout else interaction.user.name
             log_entry_user = f"{log_user_name} ({self.team_id})"
-            log_tab.append_row([str(datetime.now()), sanitize_for_sheets(log_entry_user), player['Username'], "", "JOUEUR"])
+            await asyncio.to_thread(log_tab.append_row, [str(datetime.now()), sanitize_for_sheets(log_entry_user), player['Username'], "", "JOUEUR"])
             
             # We create the team roster WITHOUT redoing a get_all_records() API call
             team_col = HEADER_POOL.index("Team_Assigned")
@@ -290,7 +290,7 @@ class PackView(discord.ui.View):
         await interaction.response.defer()
         
         try:
-            all_draft_values = draft_tab.get_all_values()
+            all_draft_values = await asyncio.to_thread(draft_tab.get_all_values)
             draft_row = next(i + 1 for i, r in enumerate(all_draft_values) if r and r[0] == self.team_id and str(self.captain_id) in r)
             draft_data = all_draft_values[draft_row - 1]
             rerolls_left = int(draft_data[6]) if len(draft_data) > 6 and str(draft_data[6]).isdigit() else 0
@@ -299,9 +299,9 @@ class PackView(discord.ui.View):
                 self.picked = False
                 return await interaction.response.send_message("❌ No more rerolls!", ephemeral=True)
 
-            draft_tab.update_cell(draft_row, 7, rerolls_left - 1)
+            await asyncio.to_thread(draft_tab.update_cell, draft_row, 7, rerolls_left - 1)
             
-            all_players = pool_tab.get_all_records()
+            all_players = await asyncio.to_thread(pool_tab.get_all_records)
             team_ssr = sum(1 for p in all_players if str(p.get('Team_Assigned')) == self.team_id and p['Tier'] == 'SSR')
             packs_opened = int(draft_data[2]) if len(draft_data) > 2 and draft_data[2] else 0
             
@@ -334,7 +334,7 @@ async def spawn_pack_for_turn(channel, expected_row):
     captain_id_str = next((c for c in expected_row if str(c).isdigit() and len(str(c)) > 15), None)
     captain_id = int(captain_id_str) if captain_id_str else 0
     
-    all_players = pool_tab.get_all_records()
+    all_players = await asyncio.to_thread(pool_tab.get_all_records)
     team_ssr = sum(1 for p in all_players if str(p.get('Team_Assigned')) == team_id and p['Tier'] == 'SSR')
     
     current_pack = generate_player_pack(all_players, {'ssr_count': team_ssr, 'packs_opened': packs_opened})
@@ -364,7 +364,7 @@ async def admin_force_pack(interaction: discord.Interaction):
         return await interaction.response.send_message("⛔ Access denied.", ephemeral=True)
     await interaction.response.defer()
     try:
-        all_draft_values = draft_tab.get_all_values()
+        all_draft_values = await asyncio.to_thread(draft_tab.get_all_values)
         valid_draft_rows = [r for r in all_draft_values[1:] if r and r[0]]
         N = len(valid_draft_rows)
         
@@ -386,27 +386,27 @@ async def admin_reset_draft(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         # Reset Pool
-        players = pool_tab.get_all_records()
+        players = await asyncio.to_thread(pool_tab.get_all_records)
         if players:
             num = len(players)
-            header = pool_tab.row_values(1)
+            header = await asyncio.to_thread(pool_tab.row_values, 1)
             s_col = chr(64 + header.index("Status") + 1)
             t_col = chr(64 + header.index("Team_Assigned") + 1)
-            pool_tab.update(range_name=f"{s_col}2:{s_col}{num+1}", values=[["Available"] for _ in range(num)])
-            pool_tab.update(range_name=f"{t_col}2:{t_col}{num+1}", values=[[""] for _ in range(num)])
+            await asyncio.to_thread(pool_tab.update, range_name=f"{s_col}2:{s_col}{num+1}", values=[["Available"] for _ in range(num)])
+            await asyncio.to_thread(pool_tab.update, range_name=f"{t_col}2:{t_col}{num+1}", values=[[""] for _ in range(num)])
         
         # Reset Draft
-        rows = len(draft_tab.get_all_values())
+        rows = len(await asyncio.to_thread(draft_tab.get_all_values))
         if rows > 1:
-            draft_tab.update(range_name=f"C2:C{rows}", values=[[0] for _ in range(rows-1)]) # Opened
-            draft_tab.update(range_name=f"D2:D{rows}", values=[[8] for _ in range(rows-1)]) # Remaining
-            draft_tab.update(range_name=f"F2:F{rows}", values=[[""] for _ in range(rows-1)]) # Team list
-            draft_tab.update(range_name=f"G2:G{rows}", values=[[1] for _ in range(rows-1)]) # Rerolls
+            await asyncio.to_thread(draft_tab.update, range_name=f"C2:C{rows}", values=[[0] for _ in range(rows-1)]) # Opened
+            await asyncio.to_thread(draft_tab.update, range_name=f"D2:D{rows}", values=[[8] for _ in range(rows-1)]) # Remaining
+            await asyncio.to_thread(draft_tab.update, range_name=f"F2:F{rows}", values=[[""] for _ in range(rows-1)]) # Team list
+            await asyncio.to_thread(draft_tab.update, range_name=f"G2:G{rows}", values=[[1] for _ in range(rows-1)]) # Rerolls
         
         # Reset Inventory & Logs
-        log_h = log_tab.row_values(1)
-        log_tab.clear()
-        log_tab.append_row(log_h)
+        log_h = await asyncio.to_thread(log_tab.row_values, 1)
+        await asyncio.to_thread(log_tab.clear)
+        await asyncio.to_thread(log_tab.append_row, log_h)
 
         await interaction.followup.send("✅ Reset complete!")
     except Exception as e: await interaction.followup.send(f"Error: {e}")
@@ -417,7 +417,7 @@ async def start_draft(interaction: discord.Interaction):
         return await interaction.response.send_message("⛔ Access denied.", ephemeral=True)
     await interaction.response.defer()
     try:
-        all_draft_values = draft_tab.get_all_values()
+        all_draft_values = await asyncio.to_thread(draft_tab.get_all_values)
         valid_draft_rows = [r for r in all_draft_values[1:] if r and r[0]]
         
         expected_row, _, _ = get_expected_turn(valid_draft_rows)
@@ -435,14 +435,14 @@ async def my_team(interaction: discord.Interaction):
     # ephemeral=True ensures that only the player will see the message
     await interaction.response.defer(ephemeral=True)
     try:
-        all_draft_values = draft_tab.get_all_values()
+        all_draft_values = await asyncio.to_thread(draft_tab.get_all_values)
         # We search for ALL teams associated with this ID (useful for your tests)
         teams = [r for r in all_draft_values[1:] if r and user_id in r]
         
         if not teams:
             return await interaction.followup.send("❌ You are not the captain of any team.", ephemeral=True)
         
-        all_players = pool_tab.get_all_records()
+        all_players = await asyncio.to_thread(pool_tab.get_all_records)
         embeds = []
         for team_data in teams:
             team_id = team_data[0]
