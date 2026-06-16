@@ -9,6 +9,7 @@ from datetime import datetime
 import time
 import os
 from dotenv import load_dotenv
+import asyncio
 
 # --- LOADING ENVIRONMENT VARIABLES ---
 load_dotenv()
@@ -36,6 +37,7 @@ pool_tab = spreadsheet.worksheet("Pool_Players")
 
 # --- CACHING HEADERS ---
 HEADER_POOL = pool_tab.row_values(1)
+CACHED_WEAPONS = None
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
@@ -461,7 +463,7 @@ async def pull_weapon(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     try:
         # 1. Inventory and permission check
-        inventory_data = inventory_tab.get_all_values()
+        inventory_data = await asyncio.to_thread(inventory_tab.get_all_values)
         if len(inventory_data) < 2:
             return await interaction.followup.send("⚠️ The inventory is empty.", ephemeral=True)
         inventory_header = inventory_data[0]
@@ -485,12 +487,15 @@ async def pull_weapon(interaction: discord.Interaction):
         if available_packs <= 0:
             return await interaction.followup.send("❌ You have no more weapon draws available.", ephemeral=True)
 
-        # 2. Weapon draw logic
-        weapons_data = weapons_tab.get_all_values()
-        if len(weapons_data) < 2:
-            return await interaction.followup.send("⚠️ No weapons are configured in the database.", ephemeral=True)
-        weapons_header = weapons_data[0]
-        all_weapons = [dict(zip(weapons_header, row)) for row in weapons_data[1:]]
+        # 2. Weapon draw logic (Cached)
+        global CACHED_WEAPONS
+        if CACHED_WEAPONS is None:
+            weapons_data = await asyncio.to_thread(weapons_tab.get_all_values)
+            if len(weapons_data) < 2:
+                return await interaction.followup.send("⚠️ No weapons are configured in the database.", ephemeral=True)
+            weapons_header = weapons_data[0]
+            CACHED_WEAPONS = [dict(zip(weapons_header, row)) for row in weapons_data[1:]]
+        all_weapons = CACHED_WEAPONS
 
         rarities = ['EX', 'SSR', 'SR', 'R']
         weights = [0.5, 15.5, 34.0, 50.0]
@@ -517,14 +522,14 @@ async def pull_weapon(interaction: discord.Interaction):
             missing = [c for c in ['available packs', 'weapon count', 'weapon list'] if c not in inventory_header_lower]
             return await interaction.followup.send(f"❌ Column(s) not found in inventory (check spelling in Google Sheet): {', '.join(missing)}", ephemeral=True)
 
-        inventory_tab.batch_update([
+        await asyncio.to_thread(inventory_tab.batch_update, [
             {'range': rowcol_to_a1(team_inventory_row_index, packs_col), 'values': [[new_packs]]},
             {'range': rowcol_to_a1(team_inventory_row_index, count_col), 'values': [[new_weapon_count]]},
             {'range': rowcol_to_a1(team_inventory_row_index, list_col), 'values': [[new_weapon_list]]},
         ])
 
         # 4. Logs and result display
-        log_tab.append_row([str(datetime.now()), sanitize_for_sheets(interaction.user.name), weapon_name, drawn_weapon.get('Effect', ''), "ARME"])
+        await asyncio.to_thread(log_tab.append_row, [str(datetime.now()), sanitize_for_sheets(interaction.user.name), weapon_name, drawn_weapon.get('Effect', ''), "ARME"])
 
         rarity_emojis = {"EX": "🔥", "SSR": "🌟", "SR": "✨", "R": "⚪"}
         emoji = rarity_emojis.get(drawn_rarity, "🗡️")
