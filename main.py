@@ -3,7 +3,7 @@ from discord import app_commands
 from discord.ext import commands
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from gspread.utils import rowcol_to_a1
+from gspread.utils import rowcol_to_a1, col_to_a1
 import random
 from datetime import datetime
 import time
@@ -36,7 +36,14 @@ log_tab = spreadsheet.worksheet("Logs_Gacha")
 pool_tab = spreadsheet.worksheet("Pool_Players")
 
 # --- CACHING HEADERS ---
-HEADER_POOL = pool_tab.row_values(1)
+HEADER_POOL = None
+
+async def get_header_pool():
+    global HEADER_POOL
+    if HEADER_POOL is None:
+        HEADER_POOL = await asyncio.to_thread(pool_tab.row_values, 1)
+    return HEADER_POOL
+
 CACHED_WEAPONS = None
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
@@ -66,16 +73,19 @@ def generate_player_pack(available_players, team_stats, exclude_ids=None):
     srs = [p for p in pool if p['Tier'] == 'SR']
     rs = [p for p in pool if p['Tier'] == 'R']
     
+    ssr_count = team_stats.get('ssr_count', 0)
+    
     for i in range(5):
         # SSR PITY RULE: If 8th pack (index 7) and 0 SSR -> Force SSR in slot 1
         force_ssr = (team_stats.get('packs_opened') == 7 and team_stats.get('ssr_count') == 0 and i == 0)
         
         rand = random.random() * 100
-        can_get_ssr = (team_stats.get('ssr_count') < 2 and ssrs) # Maximum 2 SSR
+        can_get_ssr = (ssr_count < 2 and ssrs) # Maximum 2 SSR
         
         if (rand <= 3 or force_ssr) and can_get_ssr:
             player = random.choice(ssrs)
             ssrs.remove(player)
+            ssr_count += 1
         elif rand <= 31 and srs:
             player = random.choice(srs)
             srs.remove(player)
@@ -83,17 +93,30 @@ def generate_player_pack(available_players, team_stats, exclude_ids=None):
             player = random.choice(rs)
             rs.remove(player)
         else:
-            remaining = ssrs + srs + rs
-            player = random.choice(remaining) if remaining else None
+            remaining = (ssrs if ssr_count < 2 else []) + srs + rs
+            if remaining:
+                player = random.choice(remaining)
+                if player in ssrs:
+                    ssrs.remove(player)
+                    ssr_count += 1
+                elif player in srs:
+                    srs.remove(player)
+                elif player in rs:
+                    rs.remove(player)
+            else:
+                player = None
         
         if player: pack.append(player)
 
     # SR+ GUARANTEE RULE: At least 1 per pack
     has_sr_plus = any(p['Tier'] in ['SSR', 'SR'] for p in pack)
     if not has_sr_plus and (ssrs or srs):
-        pool_fix = (ssrs if team_stats.get('ssr_count') < 2 else []) + srs
+        pool_fix = (ssrs if ssr_count < 2 else []) + srs
         if pool_fix and len(pack) > 0:
-            pack[-1] = random.choice(pool_fix)
+            chosen = random.choice(pool_fix)
+            pack[-1] = chosen
+            if chosen['Tier'] == 'SSR':
+                ssr_count += 1
             
     return pack
 
@@ -147,7 +170,12 @@ class PackView(discord.ui.View):
             self.picked = True
         
         try:
-            all_draft_values = await asyncio.to_thread(draft_tab.get_all_values)
+            # Parallel read of draft, pool, and headers
+            all_draft_values, all_pool_values, header_pool = await asyncio.gather(
+                asyncio.to_thread(draft_tab.get_all_values),
+                asyncio.to_thread(pool_tab.get_all_values),
+                get_header_pool()
+            )
             valid_draft_rows = [r for r in all_draft_values[1:] if r and r[0]]
             
             expected_row, total_opened, N = get_expected_turn(valid_draft_rows)
@@ -155,23 +183,15 @@ class PackView(discord.ui.View):
             if expected_row:
                 if not is_timeout:
                     if str(interaction.user.id) not in expected_row:
+                        self.picked = False
                         return await interaction.followup.send("❌ It's not your turn anymore (you may have already confirmed a pick)!", ephemeral=True)
 
             player = self.pack_data[index]
-            # --- GOOGLE SHEETS API OPTIMIZATION ---
-            # We retrieve the pool values all at once (Avoids find() + get_all_records())
-            all_pool_values = await asyncio.to_thread(pool_tab.get_all_values)
-            osu_id_col = HEADER_POOL.index("Osu_ID")
+            osu_id_col = header_pool.index("Osu_ID")
             player_row_idx = next(i + 1 for i, r in enumerate(all_pool_values) if len(r) > osu_id_col and str(r[osu_id_col]) == str(player['Osu_ID']))
 
-            status_idx = HEADER_POOL.index("Status") + 1
-            team_assigned_idx = HEADER_POOL.index("Team_Assigned") + 1
-            
-            # Batch Update: Updates the 2 player cells in a single request
-            await asyncio.to_thread(pool_tab.batch_update, [
-                {'range': rowcol_to_a1(player_row_idx, status_idx), 'values': [["Drafted"]]},
-                {'range': rowcol_to_a1(player_row_idx, team_assigned_idx), 'values': [[self.team_id]]}
-            ])
+            status_idx = header_pool.index("Status") + 1
+            team_assigned_idx = header_pool.index("Team_Assigned") + 1
             
             draft_row = next(i + 1 for i, r in enumerate(all_draft_values) if r and r[0] == self.team_id and str(self.captain_id) in r)
             draft_data = all_draft_values[draft_row - 1]
@@ -200,16 +220,24 @@ class PackView(discord.ui.View):
             draft_data[3] = max(0, 8 - new_opened)
             draft_data[5] = new_team_str
             draft_data[6] = current_rerolls
-            await asyncio.to_thread(draft_tab.update, range_name=f"C{draft_row}:G{draft_row}", values=[draft_data[2:7]])
             
             log_user_name = "AUTO-PICK" if is_timeout else interaction.user.name
             log_entry_user = f"{log_user_name} ({self.team_id})"
-            await asyncio.to_thread(log_tab.append_row, [str(datetime.now()), sanitize_for_sheets(log_entry_user), player['Username'], "", "JOUEUR"])
+            
+            # Batch update all writes in parallel
+            await asyncio.gather(
+                asyncio.to_thread(pool_tab.batch_update, [
+                    {'range': rowcol_to_a1(player_row_idx, status_idx), 'values': [["Drafted"]]},
+                    {'range': rowcol_to_a1(player_row_idx, team_assigned_idx), 'values': [[self.team_id]]}
+                ]),
+                asyncio.to_thread(draft_tab.update, range_name=f"C{draft_row}:G{draft_row}", values=[draft_data[2:7]]),
+                asyncio.to_thread(log_tab.append_row, [str(datetime.now()), sanitize_for_sheets(log_entry_user), player['Username'], "", "JOUEUR"])
+            )
             
             # We create the team roster WITHOUT redoing a get_all_records() API call
-            team_col = HEADER_POOL.index("Team_Assigned")
-            user_col = HEADER_POOL.index("Username")
-            tier_col = HEADER_POOL.index("Tier")
+            team_col = header_pool.index("Team_Assigned")
+            user_col = header_pool.index("Username")
+            tier_col = header_pool.index("Tier")
             
             members = []
             for r in all_pool_values[1:]:
@@ -261,6 +289,7 @@ class PackView(discord.ui.View):
                 await spawn_pack_for_turn(channel, expected_row)
                 
         except Exception as e:
+            self.picked = False
             # In case of error
             if is_timeout:
                 if self.message: await self.message.channel.send(f"Technical error (Auto-pick): {e}")
@@ -385,31 +414,64 @@ async def admin_reset_draft(interaction: discord.Interaction):
         return await interaction.response.send_message("⛔ Access denied.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     try:
-        # Reset Pool
-        players = await asyncio.to_thread(pool_tab.get_all_records)
-        if players:
-            num = len(players)
-            header = await asyncio.to_thread(pool_tab.row_values, 1)
-            s_col = chr(64 + header.index("Status") + 1)
-            t_col = chr(64 + header.index("Team_Assigned") + 1)
-            await asyncio.to_thread(pool_tab.update, range_name=f"{s_col}2:{s_col}{num+1}", values=[["Available"] for _ in range(num)])
-            await asyncio.to_thread(pool_tab.update, range_name=f"{t_col}2:{t_col}{num+1}", values=[[""] for _ in range(num)])
-        
-        # Reset Draft
-        rows = len(await asyncio.to_thread(draft_tab.get_all_values))
-        if rows > 1:
-            await asyncio.to_thread(draft_tab.update, range_name=f"C2:C{rows}", values=[[0] for _ in range(rows-1)]) # Opened
-            await asyncio.to_thread(draft_tab.update, range_name=f"D2:D{rows}", values=[[8] for _ in range(rows-1)]) # Remaining
-            await asyncio.to_thread(draft_tab.update, range_name=f"F2:F{rows}", values=[[""] for _ in range(rows-1)]) # Team list
-            await asyncio.to_thread(draft_tab.update, range_name=f"G2:G{rows}", values=[[1] for _ in range(rows-1)]) # Rerolls
-        
-        # Reset Inventory & Logs
-        log_h = await asyncio.to_thread(log_tab.row_values, 1)
-        await asyncio.to_thread(log_tab.clear)
-        await asyncio.to_thread(log_tab.append_row, log_h)
+        # Clear weapons cache as part of reset
+        global CACHED_WEAPONS
+        CACHED_WEAPONS = None
+
+        # Parallel read of pool values, draft values, and log headers
+        all_pool_values, all_draft_values, log_h = await asyncio.gather(
+            asyncio.to_thread(pool_tab.get_all_values),
+            asyncio.to_thread(draft_tab.get_all_values),
+            asyncio.to_thread(log_tab.row_values, 1)
+        )
+
+        pool_tasks = []
+        if len(all_pool_values) > 1:
+            header = all_pool_values[0]
+            num = len(all_pool_values) - 1
+            s_col = col_to_a1(header.index("Status") + 1)
+            t_col = col_to_a1(header.index("Team_Assigned") + 1)
+            pool_tasks.append(asyncio.to_thread(pool_tab.update, range_name=f"{s_col}2:{s_col}{num+1}", values=[["Available"] for _ in range(num)]))
+            pool_tasks.append(asyncio.to_thread(pool_tab.update, range_name=f"{t_col}2:{t_col}{num+1}", values=[[""] for _ in range(num)]))
+
+        draft_tasks = []
+        if len(all_draft_values) > 1:
+            rows = len(all_draft_values)
+            draft_tasks.append(asyncio.to_thread(draft_tab.update, range_name=f"C2:C{rows}", values=[[0] for _ in range(rows-1)])) # Opened
+            draft_tasks.append(asyncio.to_thread(draft_tab.update, range_name=f"D2:D{rows}", values=[[8] for _ in range(rows-1)])) # Remaining
+            draft_tasks.append(asyncio.to_thread(draft_tab.update, range_name=f"F2:F{rows}", values=[[""] for _ in range(rows-1)])) # Team list
+            draft_tasks.append(asyncio.to_thread(draft_tab.update, range_name=f"G2:G{rows}", values=[[1] for _ in range(rows-1)])) # Rerolls
+
+        async def reset_log():
+            await asyncio.to_thread(log_tab.clear)
+            if log_h:
+                await asyncio.to_thread(log_tab.append_row, log_h)
+
+        # Execute all reset tasks in parallel
+        await asyncio.gather(
+            *pool_tasks,
+            *draft_tasks,
+            reset_log()
+        )
 
         await interaction.followup.send("✅ Reset complete!")
     except Exception as e: await interaction.followup.send(f"Error: {e}")
+
+@bot.tree.command(name="admin_reload_weapons", description="👑 Reloads the weapons database cache from Google Sheets")
+async def admin_reload_weapons(interaction: discord.Interaction):
+    if interaction.user.id != ADMIN_ID:
+        return await interaction.response.send_message("⛔ Access denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        global CACHED_WEAPONS
+        weapons_data = await asyncio.to_thread(weapons_tab.get_all_values)
+        if len(weapons_data) < 2:
+            return await interaction.followup.send("⚠️ No weapons are configured in the database.")
+        weapons_header = weapons_data[0]
+        CACHED_WEAPONS = [dict(zip(weapons_header, row)) for row in weapons_data[1:]]
+        await interaction.followup.send(f"✅ Weapons database reloaded successfully! ({len(CACHED_WEAPONS)} weapons cached)")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error reloading weapons: {e}")
 
 @bot.tree.command(name="start_draft", description="👑 Announces the start of the draft and pings the first player")
 async def start_draft(interaction: discord.Interaction):
@@ -522,14 +584,15 @@ async def pull_weapon(interaction: discord.Interaction):
             missing = [c for c in ['available packs', 'weapon count', 'weapon list'] if c not in inventory_header_lower]
             return await interaction.followup.send(f"❌ Column(s) not found in inventory (check spelling in Google Sheet): {', '.join(missing)}", ephemeral=True)
 
-        await asyncio.to_thread(inventory_tab.batch_update, [
-            {'range': rowcol_to_a1(team_inventory_row_index, packs_col), 'values': [[new_packs]]},
-            {'range': rowcol_to_a1(team_inventory_row_index, count_col), 'values': [[new_weapon_count]]},
-            {'range': rowcol_to_a1(team_inventory_row_index, list_col), 'values': [[new_weapon_list]]},
-        ])
-
-        # 4. Logs and result display
-        await asyncio.to_thread(log_tab.append_row, [str(datetime.now()), sanitize_for_sheets(interaction.user.name), weapon_name, drawn_weapon.get('Effect', ''), "ARME"])
+        # 3 & 4. Update inventory and logs in parallel
+        await asyncio.gather(
+            asyncio.to_thread(inventory_tab.batch_update, [
+                {'range': rowcol_to_a1(team_inventory_row_index, packs_col), 'values': [[new_packs]]},
+                {'range': rowcol_to_a1(team_inventory_row_index, count_col), 'values': [[new_weapon_count]]},
+                {'range': rowcol_to_a1(team_inventory_row_index, list_col), 'values': [[new_weapon_list]]},
+            ]),
+            asyncio.to_thread(log_tab.append_row, [str(datetime.now()), sanitize_for_sheets(interaction.user.name), weapon_name, drawn_weapon.get('Effect', ''), "ARME"])
+        )
 
         rarity_emojis = {"EX": "🔥", "SSR": "🌟", "SR": "✨", "R": "⚪"}
         emoji = rarity_emojis.get(drawn_rarity, "🗡️")
